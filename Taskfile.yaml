@@ -125,8 +125,12 @@ tasks:
         echo "=== Node Versions ==="
         kubectl get nodes -o wide
         echo ""
-        echo "=== Unhealthy Pods ==="
-        kubectl get pods -A | grep -v -E "Running|Completed|Succeeded" || echo "All pods healthy."
+        echo "=== Unhealthy Pods (excluding system-upgrade) ==="
+        # Each node restart leaves SUC upgrade pods in Unknown status — harmless ghosts, not real faults.
+        # Exclude the system-upgrade namespace so genuine workload problems stand out.
+        UNHEALTHY=$(kubectl get pods -A --field-selector=metadata.namespace!=system-upgrade --no-headers 2>/dev/null \
+          | grep -v -E "Running|Completed|Succeeded" || true)
+        if [ -n "$UNHEALTHY" ]; then echo "$UNHEALTHY"; else echo "All pods healthy."; fi
         echo ""
         echo "=== cert-manager Certificates ==="
         kubectl get certificates -A 2>/dev/null || echo "(no certificates found)"
@@ -251,3 +255,10 @@ tasks:
       KUBECONFIG: "{{.TASKFILE_DIR}}/kubeconfig-orbstack.yaml"
     cmds:
       - watch -n 10 "kubectl get plans -n system-upgrade -o wide; echo; kubectl get jobs -n system-upgrade; echo; kubectl get nodes -o wide"
+
+  k3s:upgrade:check:
+    desc: A single round of k3s:upgrade:watch
+    env:
+      KUBECONFIG: "{{.TASKFILE_DIR}}/kubeconfig-orbstack.yaml"
+    cmds:
+      - kubectl get plans -n system-upgrade -o wide; echo; kubectl get jobs -n system-upgrade; echo; kubectl get nodes -o wide

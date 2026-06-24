@@ -248,18 +248,19 @@ Note the image tag format difference: the `prepare` image uses `v1.25.16-k3s4` (
 
 Repeat with updated version strings for the subsequent hops. The `task k3s:upgrade -- <version>` command in this repo's Taskfile handles the substitution automatically.
 
+> **Expected during each hop — don't mistake it for a hang.** SUC upgrades each node one at a time, servers before agents, and the upgrade job runs *on the node it's upgrading*. When k3s restarts on that node, the kubelet stops reporting the pod that triggered the restart, so it's orphaned into `Unknown` status and the node briefly shows `Ready,SchedulingDisabled` (cordoned). SUC then runs a replacement pod that finalizes and uncordons. A node sitting cordoned mid-hop is normal; confirm completion via `kubectl get plans -n system-upgrade -o wide` showing `COMPLETE=True`, not by watching individual pods. After the hop, one `Unknown` ghost pod per node remains in `system-upgrade` — harmless. Clear them with `kubectl delete jobs -n system-upgrade --all` (the plans are CRDs and survive; only the completed jobs and their ghost pods are removed).
+
 ### Health check after each hop
 
-Run this before proceeding to the next version:
+Run this once `plans` show `COMPLETE=True`, before proceeding to the next version:
 
 ```bash
 # All nodes Ready and on the new version
 kubectl get nodes -o wide
 
-# No unexpected non-running pods
-kubectl get pods -A \
-  --field-selector=status.phase!=Running,status.phase!=Succeeded \
-  | grep -v Completed
+# Unhealthy pods, excluding the system-upgrade ghosts (Unknown-status job pods are expected)
+kubectl get pods -A --field-selector=metadata.namespace!=system-upgrade --no-headers \
+  | grep -v -E "Running|Completed|Succeeded" || echo "All pods healthy."
 
 # Certificates still valid
 kubectl get certificates -A
