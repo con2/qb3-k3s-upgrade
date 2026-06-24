@@ -1,0 +1,211 @@
+version: '3'
+
+# Recommended workflow:
+#   task up                              # create cluster, mirror prod state
+#   task upgrade:suc                     # pre-work: upgrade SUC
+#   task upgrade:cert-manager            # pre-work: upgrade cert-manager
+#   task k3s:upgrade -- v1.25.16+k3s4   # hop 1
+#   task k3s:upgrade:watch               # watch progress (Ctrl-C when done)
+#   task k3s:health                      # verify before continuing
+#   task k3s:upgrade -- v1.29.14+k3s1   # hop 2
+#   task k3s:upgrade:watch
+#   task k3s:health
+#   task k3s:upgrade -- v1.36.1+k3s1    # final hop
+#   task k3s:upgrade:watch
+#   task k3s:health
+#   task down                            # clean up
+
+vars:
+  TEMP_DIR: /tmp
+  K3S_BASELINE: v1.21.6+k3s1      # Starting version — matches production
+  UPGRADE_STOP1: v1.25.16+k3s4    # First stop: crosses v1.22/v1.24 breaking changes
+  UPGRADE_STOP2: v1.29.14+k3s1    # Second stop: crosses v1.25–v1.28 breaking changes
+  UPGRADE_FINAL: v1.36.1+k3s1     # Target: current latest stable
+
+tasks:
+
+  # ── Cluster lifecycle ─────────────────────────────────────────────────────────
+
+  up:
+    desc: "Full setup: create VMs, fetch kubeconfig, install old cert-manager and SUC to mirror production"
+    cmds:
+      - task: vms:create
+      - task: k3s:kubeconfig
+      - task: mirror:all
+
+  down:
+    desc: "Tear down all VMs (data will be lost)"
+    cmds:
+      - task: vms:delete
+
+  # ── VM management ─────────────────────────────────────────────────────────────
+
+  vms:create:
+    desc: Create OrbStack VMs (skips existing); K3s v1.21.6+k3s1 is provisioned via cloud-init at boot
+    cmds:
+      - |
+        [ -f .cluster-token ] || openssl rand -hex 32 > .cluster-token
+        export K3S_TOKEN=$(cat .cluster-token)
+
+        if ! orb list | awk '{print $1}' | grep -q '^upgr-cp$'; then
+          envsubst '$K3S_TOKEN' < cloud-init/control-plane.yaml \
+            > {{.TEMP_DIR}}/cloud-init-cp.yaml
+          orb create ubuntu upgr-cp --user-data "{{.TEMP_DIR}}/cloud-init-cp.yaml"
+        fi
+
+        echo "Waiting for k3s to be active on upgr-cp..."
+        until orb run -m upgr-cp systemctl is-active k3s 2>/dev/null | grep -q "^active"; do
+          sleep 3
+        done
+
+        export CP_IP=$(orb list | awk '/^upgr-cp/{print $NF}')
+        echo "Control plane IP: ${CP_IP}"
+
+        for W in upgr-w1 upgr-w2; do
+          if ! orb list | awk '{print $1}' | grep -q "^${W}$"; then
+            envsubst '$K3S_TOKEN $CP_IP' < cloud-init/worker.yaml \
+              > {{.TEMP_DIR}}/cloud-init-${W}.yaml
+            orb create ubuntu "$W" --user-data "{{.TEMP_DIR}}/cloud-init-${W}.yaml"
+          fi
+        done
+
+  vms:delete:
+    desc: Delete all OrbStack VMs
+    cmds:
+      - orb delete -f upgr-cp || true
+      - orb delete -f upgr-w1 || true
+      - orb delete -f upgr-w2 || true
+
+  # ── Kubeconfig ────────────────────────────────────────────────────────────────
+
+  k3s:kubeconfig:
+    desc: Fetch kubeconfig from control plane, write kubeconfig-orbstack.yaml
+    cmds:
+      - >
+        orb run -m upgr-cp -u root cat /etc/rancher/k3s/k3s.yaml
+        | sed 's|server: https://127.0.0.1:6443|server: https://upgr-cp.orb.local:6443|'
+        > kubeconfig-orbstack.yaml
+    generates:
+      - kubeconfig-orbstack.yaml
+
+  # ── Status and health ─────────────────────────────────────────────────────────
+
+  k3s:status:
+    desc: Show current node versions and upgrade plan/job status
+    env:
+      KUBECONFIG: "{{.TASKFILE_DIR}}/kubeconfig-orbstack.yaml"
+    cmds:
+      - |
+        echo "=== Nodes ==="
+        kubectl get nodes -o wide
+        echo ""
+        echo "=== Upgrade Plans ==="
+        kubectl get plans -n system-upgrade -o wide 2>/dev/null || echo "(no plans or system-upgrade namespace not found)"
+        echo ""
+        echo "=== Upgrade Jobs ==="
+        kubectl get jobs -n system-upgrade 2>/dev/null || true
+
+  k3s:health:
+    desc: Post-upgrade health check — node versions, unhealthy pods, cert-manager certificate status
+    env:
+      KUBECONFIG: "{{.TASKFILE_DIR}}/kubeconfig-orbstack.yaml"
+    cmds:
+      - |
+        echo "=== Node Versions ==="
+        kubectl get nodes -o wide
+        echo ""
+        echo "=== Unhealthy Pods ==="
+        kubectl get pods -A | grep -v -E "Running|Completed|Succeeded" || echo "All pods healthy."
+        echo ""
+        echo "=== cert-manager Certificates ==="
+        kubectl get certificates -A 2>/dev/null || echo "(no certificates found)"
+
+  # ── Mirror production state ───────────────────────────────────────────────────
+
+  mirror:all:
+    desc: Install old cert-manager and SUC to match production state (intentionally old versions)
+    cmds:
+      - task: mirror:cert-manager
+      - task: mirror:suc
+
+  mirror:cert-manager:
+    desc: "Install cert-manager v1.0.3 — intentionally old to mirror production"
+    env:
+      KUBECONFIG: "{{.TASKFILE_DIR}}/kubeconfig-orbstack.yaml"
+    cmds:
+      - kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.0.3/cert-manager.yaml
+      - kubectl rollout status deployment/cert-manager deployment/cert-manager-cainjector deployment/cert-manager-webhook -n cert-manager --timeout=120s
+
+  mirror:suc:
+    desc: "Install system-upgrade-controller v0.6.2 — intentionally old to mirror production"
+    env:
+      KUBECONFIG: "{{.TASKFILE_DIR}}/kubeconfig-orbstack.yaml"
+    cmds:
+      - kubectl apply -f https://raw.githubusercontent.com/rancher/system-upgrade-controller/v0.6.2/manifests/system-upgrade-controller.yaml
+      - kubectl rollout status deployment/system-upgrade-controller -n system-upgrade --timeout=60s
+
+  # ── Pre-upgrade component upgrades ────────────────────────────────────────────
+
+  upgrade:suc:
+    desc: Upgrade system-upgrade-controller from v0.6.2 to v0.19.2
+    env:
+      KUBECONFIG: "{{.TASKFILE_DIR}}/kubeconfig-orbstack.yaml"
+    cmds:
+      - kubectl apply -f https://github.com/rancher/system-upgrade-controller/releases/download/v0.19.2/system-upgrade-controller.yaml
+      - kubectl rollout status deployment/system-upgrade-controller -n system-upgrade --timeout=120s
+      - |
+        echo "SUC version after upgrade:"
+        kubectl get deployment system-upgrade-controller -n system-upgrade \
+          -o jsonpath='{.spec.template.spec.containers[0].image}'
+        echo
+
+  upgrade:cert-manager:
+    desc: Upgrade cert-manager to latest stable via Helm (backs up existing resources first)
+    env:
+      KUBECONFIG: "{{.TASKFILE_DIR}}/kubeconfig-orbstack.yaml"
+    cmds:
+      - helm repo add jetstack https://charts.jetstack.io 2>/dev/null || true
+      - helm repo update jetstack
+      - |
+        kubectl get certificates,certificaterequests,issuers,clusterissuers -A -o yaml \
+          > {{.TEMP_DIR}}/cert-manager-backup.yaml 2>/dev/null || true
+        echo "Backup written to {{.TEMP_DIR}}/cert-manager-backup.yaml"
+      - >
+        helm upgrade --install cert-manager jetstack/cert-manager
+        --namespace cert-manager --create-namespace
+        --set crds.enabled=true
+        --wait
+      - kubectl rollout status deployment/cert-manager deployment/cert-manager-cainjector deployment/cert-manager-webhook -n cert-manager
+      - |
+        echo "cert-manager version after upgrade:"
+        kubectl get deployment cert-manager -n cert-manager \
+          -o jsonpath='{.spec.template.spec.containers[0].image}'
+        echo
+
+  # ── K3s version upgrades ──────────────────────────────────────────────────────
+
+  k3s:upgrade:
+    desc: "Roll all nodes to a new K3s version via system-upgrade-controller. Usage: task k3s:upgrade -- v1.25.16+k3s4"
+    vars:
+      TARGET: '{{.CLI_ARGS | trim}}'
+    preconditions:
+      - sh: test -n "{{.TARGET}}"
+        msg: "Usage: task k3s:upgrade -- v1.25.16+k3s4"
+    env:
+      KUBECONFIG: "{{.TASKFILE_DIR}}/kubeconfig-orbstack.yaml"
+    cmds:
+      - |
+        export K3S_VERSION="{{.TARGET}}"
+        export K3S_VERSION_TAG="${K3S_VERSION//+/-}"
+        echo "Applying upgrade plans for ${K3S_VERSION} (image tag: ${K3S_VERSION_TAG})..."
+        envsubst '$K3S_VERSION $K3S_VERSION_TAG' < manifests/upgrade-plans.yaml.tpl \
+          | kubectl apply -f -
+        echo ""
+        echo "Upgrade queued. Watch progress with: task k3s:upgrade:watch"
+
+  k3s:upgrade:watch:
+    desc: Watch upgrade progress — node versions, jobs, and plan status (Ctrl-C to stop)
+    env:
+      KUBECONFIG: "{{.TASKFILE_DIR}}/kubeconfig-orbstack.yaml"
+    cmds:
+      - watch -n 10 "kubectl get plans -n system-upgrade -o wide; echo; kubectl get jobs -n system-upgrade; echo; kubectl get nodes -o wide"
