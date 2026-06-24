@@ -17,7 +17,7 @@ The production cluster (`qb`) runs K3s v1.21.6+k3s1 — 15 minor versions behind
 | Nodes | qb1–qb3: etcd/control-plane · qb4: worker |
 | OS | Ubuntu 20.04 (Azure), kernel 5.15 |
 | system-upgrade-controller | v0.6.2 (latest: v0.19.2) |
-| cert-manager | v1.0.3 (latest: v1.17.x) |
+| cert-manager | v1.0.3 (upgraded in steps — see pre-work item 2) |
 | ingress-nginx | v1.12.1 — modern, already supports K8s 1.32+ |
 | Old ARC (summerwind) | v0.17.0 in `actions-runner-system` |
 | New ARC | Present in `arc-systems` (migration in progress) |
@@ -72,48 +72,48 @@ kubectl rollout status deployment/system-upgrade-controller -n system-upgrade
 
 > **Why delete the ClusterRoleBinding first?** v0.6.2 binds the `system-upgrade` ServiceAccount to `cluster-admin`; v0.19.2 rebinds it to a scoped `system-upgrade-controller` role. A binding's `roleRef` is immutable, so `kubectl apply` fails with `cannot change roleRef` on that object (the Deployment still updates, but the task exits non-zero and RBAC stays on the old `cluster-admin` binding). Deleting the binding first lets the new, correctly-scoped one be created. Verified in the playground.
 
-### 2. Upgrade cert-manager — in two phases
+### 2. Upgrade cert-manager — tracking the Kubernetes version
 
-cert-manager v1.0.3 is 4.5 years old. Its cainjector patches webhook CA bundles at runtime; if it calls any API removed in v1.22 during the upgrade window, TLS breaks for every service on the cluster. So it must be modernised before the K3s upgrade crosses v1.22.
+cert-manager v1.0.3 is 4.5 years old. Its cainjector patches webhook CA bundles at runtime; if it calls any API removed in v1.22 during the upgrade window, TLS breaks for every service on the cluster. So it must be modernised as the cluster moves — but **it cannot leap straight to latest.** cert-manager must track the Kubernetes version, bumped after each hop. Two independent constraints, both found in the playground:
 
-**But it cannot go straight to latest.** The current cert-manager chart enforces `kubeVersion: >= 1.22.0-0` and refuses to install on v1.21. Verified chart floors:
+1. **Lower gate — the chart's `kubeVersion`.** The chart refuses to install on too-old a cluster. Verified floors: 1.10.x needs ≥ 1.20; **1.11.x needs ≥ 1.21** (the newest line that runs on 1.21); 1.12.x and later need ≥ 1.22.
+2. **Upper gate — `selectableFields` in the CRDs.** cert-manager **≥ v1.18** ships CRDs using `selectableFields`, a CRD-API feature only present in **k8s ≥ 1.30**. Installing those on an older cluster fails both ways: client-side `kubectl apply` blows past the 256 KB annotation limit on the giant `challenges`/`certificates` CRDs, and server-side apply fails with `selectableFields: field not declared in schema`. So don't install cert-manager ≥ v1.18 until the cluster is on k8s ≥ 1.30.
 
-| cert-manager | requires k8s |
-|---|---|
-| 1.10.x | ≥ 1.20 |
-| **1.11.x** | **≥ 1.21** ← newest line that runs on 1.21 |
-| 1.12.x and later (incl. latest) | ≥ 1.22 |
+**Always use server-side apply** (`--server-side --force-conflicts`) — it's the supported method for cert-manager's oversized CRDs and avoids the annotation limit entirely.
 
-So cert-manager is upgraded in two phases, straddling the first K3s hop. Both phases use **static manifests** — the production and playground installs are static-manifest (not Helm), and `helm upgrade --install` cannot adopt a static install without ownership conflicts.
+Recommended targets along the 1.21 → 1.36 journey (each run after reaching that k8s):
 
-**Phase A — now, while on k8s 1.21** (before the first K3s hop). Target v1.11.5: it runs on 1.21 and is modern enough (v1 webhook/CRD APIs) to survive the v1.22 API removals during the 1.21 → 1.25 hop.
+| cluster on k8s | cert-manager target | why |
+|---|---|---|
+| 1.21 (before first hop) | **v1.11.5** | newest that installs on 1.21; survives the v1.22 API removals |
+| 1.25 (after first hop) | **v1.17.4** | newest without `selectableFields`; spans 1.25 → 1.29 |
+| 1.36 (final) | **latest** (≥ v1.18) | k8s now supports `selectableFields` |
+
+Each step is the same command — back up, then server-side apply the chosen version:
 
 ```bash
-# Back up all cert-manager-managed resources first
+# Back up cert-manager-managed resources first
 kubectl get certificates,certificaterequests,issuers,clusterissuers,orders,challenges \
   -A -o yaml > cert-manager-backup-$(date +%Y%m%d).yaml
 
-# Upgrade via static manifest (includes CRDs); v1.11.5 is the k8s-1.21 ceiling
-kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.11.5/cert-manager.yaml
+# Server-side apply the target version (static manifest includes CRDs)
+VERSION=v1.11.5   # then v1.17.4 after the 1.25 hop, then latest on 1.36
+kubectl apply --server-side --force-conflicts \
+  -f https://github.com/cert-manager/cert-manager/releases/download/${VERSION}/cert-manager.yaml
 
 kubectl rollout status deployment/cert-manager \
   deployment/cert-manager-cainjector \
   deployment/cert-manager-webhook \
   -n cert-manager --timeout=180s
+
+# Confirm all CRDs converged to the new version (no split-brain)
+kubectl get crd -l app.kubernetes.io/name=cert-manager \
+  -o custom-columns=NAME:.metadata.name,VER:.metadata.labels.'app\.kubernetes\.io/version'
 ```
 
-**Phase B — after the K3s 1.25 hop** (cluster now on k8s ≥ 1.22). Upgrade to latest:
+> **Watch for split-brain.** If you ever use plain client-side `kubectl apply` here, the Deployments may update while the two largest CRDs (`challenges`, `certificates`) silently fail — leaving a new controller running against old CRD schemas. The CRD-version check above catches it; server-side apply prevents it.
 
-```bash
-kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml
-
-kubectl rollout status deployment/cert-manager \
-  deployment/cert-manager-cainjector \
-  deployment/cert-manager-webhook \
-  -n cert-manager --timeout=180s
-```
-
-> **Verify after each phase.** The webhook needs ~60–90s to warm up after a rollout — certificate issuance returns `context deadline exceeded` until it's ready, then recovers. Confirm with a self-signed Issuer + Certificate and check it reaches `Ready` (allow ≥90s), or just confirm existing certs stay valid: `kubectl get certificates -A`. The two-phase path (v1.0.3 → v1.11.5 on k8s 1.21, then → latest) was validated end-to-end in the playground.
+> **Verify after each step.** The webhook needs ~60–90s to warm up after a rollout — certificate issuance returns `context deadline exceeded` until it's ready, then recovers. Confirm with a self-signed Issuer + Certificate and check it reaches `Ready` (allow ≥90s), or just confirm existing certs stay valid: `kubectl get certificates -A`. The path v1.0.3 → v1.11.5 (on k8s 1.21) → v1.17.4 (on k8s 1.25) was validated end-to-end in the playground, including issuance.
 
 ### 3. Remove ghost Longhorn resources
 
@@ -189,7 +189,7 @@ v1.21.6+k3s1  →  v1.25.x  →  v1.29.x  →  v1.36.1+k3s1
 
 ### Why these stops
 
-- **v1.25** is the boundary where `policy/v1beta1` (PodSecurityPolicy) and `batch/v1beta1` CronJobs are removed. The PSP will already be deleted and all CronJobs already use `batch/v1`, so this stop is a verification checkpoint, not a migration step. Confirm cert-manager, ingress-nginx, and all application services are healthy before continuing. **This is also where cert-manager Phase B runs** (pre-work item 2): the cluster is now on k8s ≥ 1.22, so cert-manager can finally go to latest.
+- **v1.25** is the boundary where `policy/v1beta1` (PodSecurityPolicy) and `batch/v1beta1` CronJobs are removed. The PSP will already be deleted and all CronJobs already use `batch/v1`, so this stop is a verification checkpoint, not a migration step. Confirm cert-manager, ingress-nginx, and all application services are healthy before continuing. **This is also where cert-manager gets its next bump** (pre-work item 2): the cluster is now on k8s 1.25, so move cert-manager to v1.17.4.
 
 - **v1.29** crosses the v1.26 removal of `autoscaling/v2beta2` HPA (no HPAs exist in this cluster) and several flow-control API promotions. A second verification point before the final jump.
 
@@ -279,17 +279,18 @@ This repo's Taskfile spins up an OrbStack VM cluster that replicates the product
 task up          # create VMs + fetch kubeconfig + mirror production state
 task k3s:status  # confirm starting version
 
-task upgrade:suc                # SUC -> v0.19.2
-task upgrade:cert-manager:pre   # cert-manager -> v1.11.5 (k8s 1.21 ceiling)
+task upgrade:suc                       # SUC -> v0.19.2
+task upgrade:cert-manager -- v1.11.5   # cert-manager (k8s 1.21 ceiling)
 
 task k3s:upgrade -- v1.25.16+k3s4   # first hop
 task k3s:upgrade:watch               # follow progress
 task k3s:health                      # verify
 
-task upgrade:cert-manager:final # now on k8s >= 1.22: cert-manager -> latest
+task upgrade:cert-manager -- v1.17.4   # now on k8s 1.25: bump cert-manager
 
 task k3s:upgrade -- v1.29.14+k3s1   # second hop
 task k3s:upgrade -- v1.36.1+k3s1    # final hop
+task upgrade:cert-manager -- v1.18.2   # now on k8s 1.36: cert-manager -> latest
 
 task down        # tear down when done
 ```
@@ -302,7 +303,7 @@ The cloud-init scripts pin the K3s version via `INSTALL_K3S_VERSION=v1.21.6+k3s1
 
 | Risk | Severity | Mitigation | Status |
 |---|---|---|---|
-| cert-manager v1.0.3 runtime compatibility across v1.22 API removals | High | Two-phase upgrade: → v1.11.5 before first hop (latest can't install on k8s 1.21), → latest after the 1.25 hop | Pre-work item 2 |
+| cert-manager v1.0.3 runtime compatibility across v1.22 API removals | High | Step cert-manager with the k8s version via server-side apply (v1.11.5 on 1.21 → v1.17.4 on 1.25 → latest on 1.36); never jump to latest on old k8s | Pre-work item 2 |
 | system-upgrade-controller v0.6.2 incompatible with modern K3s upgrade images | High | Upgrade SUC to v0.19.2 first | Pre-work item 1 |
 | PodSecurityPolicy removed at v1.25 | High (if not deleted) | Delete `longhorn-nfs-provisioner` PSP before starting | Pre-work item 3 |
 | Old summerwind ARC v0.17.0 compatibility with K8s 1.22+ | Medium | Test in playground; complete migration to new ARC before upgrade | Needs investigation |
