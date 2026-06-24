@@ -76,7 +76,7 @@ Throughout this, etcd quorum held on the other two control-plane nodes (2/3), so
 
 1. **`static/ingress-letsencrypt`** — already expired *before* the upgrade (cert-manager v1.0.3 had silently stopped renewing it; the stale `Ready=True` masked it). The fresh cert-manager now reports it honestly. Likely a Let's Encrypt SAN-count/rate-limit issue on that many-host ingress — needs separate investigation.
 2. **Orphaned Longhorn PV** `pvc-2d7f2f26…` (Released) from long-decommissioned Longhorn — safe to delete.
-3. **Disk usage** on `/var/lib/rancher` — grows per upgrade hop (old images linger); prune unused images. qb2's was incidentally resolved by the disk swap onto a larger volume.
+3. **Disk usage** on `/var/lib/rancher` — grows per upgrade hop (old images linger); prune unused images (`k3s crictl rmi --prune`). qb2's `/var/lib/rancher` is at **83% (18G free) on its 100G disk** and still needs attention; note its `/mnt/big` (1000G) sits nearly empty, so expanding/relocating the rancher volume is an option. Check qb1/qb3/qb4 too.
 4. **Ubuntu 20.04 is EOL** — worth a distro upgrade as separate work (not required for K3s; the cgroup-v2 boot flag was sufficient).
 5. **cert-manager ≥ v1.18 defaults `rotationPolicy: Always`** — certificates will get new private keys at their next renewal (not immediately).
 
