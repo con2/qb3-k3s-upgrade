@@ -1,12 +1,14 @@
 [Unit]
 Description=Prune unused k3s/containerd images
-Documentation=https://github.com/.../k3s-upgrade  # WRITEUP.md "Follow-ups"
+Documentation=https://github.com/con2/qb-k3s-upgrade/blob/main/WRITEUP.md
 # Ordering only — harmless if one of these units doesn't exist on this node
 # (server nodes have k3s.service, agents have k3s-agent.service).
 After=k3s.service k3s-agent.service
 
 [Service]
 Type=oneshot
+# k3s/crictl warns "$HOME is not defined" under systemd; set it to avoid the noise.
+Environment=HOME=/root
 # --timeout (a global crictl flag, before the subcommand) must be generous:
 # the default ~2s times out on a busy disk and leaves removals incomplete.
 ExecStart=/usr/local/bin/k3s crictl --timeout 10m rmi --prune
