@@ -74,14 +74,12 @@ kubectl rollout status deployment/system-upgrade-controller -n system-upgrade
 
 ### 2. Upgrade cert-manager — tracking the Kubernetes version
 
-cert-manager v1.0.3 is 4.5 years old. Its cainjector patches webhook CA bundles at runtime; if it calls any API removed in v1.22 during the upgrade window, TLS breaks for every service on the cluster. So it must be modernised as the cluster moves — but **it cannot leap straight to latest.** cert-manager must track the Kubernetes version, bumped after each hop. Two independent constraints, both found in the playground:
+cert-manager v1.0.3 is 4.5 years old and is **managed as a Helm release** (`helm ls -n cert-manager` shows the `cert-manager-v1.0.3` chart). Its cainjector patches webhook CA bundles at runtime; if it calls any API removed in v1.22 during the upgrade window, TLS breaks for every service on the cluster. So it must be modernised as the cluster moves — but **it cannot leap straight to latest.** cert-manager must track the Kubernetes version, bumped via `helm upgrade` after each hop. Two independent constraints, both found in the playground:
 
 1. **Lower gate — the chart's `kubeVersion`.** The chart refuses to install on too-old a cluster. Verified floors: 1.10.x needs ≥ 1.20; **1.11.x needs ≥ 1.21** (the newest line that runs on 1.21); 1.12.x and later need ≥ 1.22.
-2. **Upper gate — `selectableFields` in the CRDs.** cert-manager **≥ v1.18** ships CRDs using `selectableFields`, a CRD-API feature only present in **k8s ≥ 1.30**. Installing those on an older cluster fails both ways: client-side `kubectl apply` blows past the 256 KB annotation limit on the giant `challenges`/`certificates` CRDs, and server-side apply fails with `selectableFields: field not declared in schema`. So don't install cert-manager ≥ v1.18 until the cluster is on k8s ≥ 1.30.
+2. **Upper gate — `selectableFields` in the CRDs.** cert-manager **≥ v1.18** ships CRDs using `selectableFields`, a CRD-API feature only present in **k8s ≥ 1.30**. Don't install cert-manager ≥ v1.18 until the cluster is on k8s ≥ 1.30.
 
-**Always use server-side apply** (`--server-side --force-conflicts`) — it's the supported method for cert-manager's oversized CRDs and avoids the annotation limit entirely.
-
-Recommended targets along the 1.21 → 1.36 journey (each run after reaching that k8s):
+Recommended targets along the 1.21 → 1.36 journey (each run via `helm upgrade` after reaching that k8s):
 
 | cluster on k8s | cert-manager target | why |
 |---|---|---|
@@ -89,29 +87,27 @@ Recommended targets along the 1.21 → 1.36 journey (each run after reaching tha
 | 1.25 (after first hop) | **v1.17.4** | newest without `selectableFields`; spans 1.25 → 1.29 |
 | 1.36 (final) | **latest** (≥ v1.18) | k8s now supports `selectableFields` |
 
-Each step is the same command — back up, then server-side apply the chosen version:
+> **The CRD value flag was renamed.** Charts ≤ v1.14 gate CRDs behind `--set installCRDs=true`; v1.15+ use `--set crds.enabled=true`. So the first two bumps use `installCRDs`, the final one uses `crds.enabled`. (The Taskfile's `upgrade:cert-manager` picks the right flag automatically from the target version.)
+
+Each step — back up, then `helm upgrade` to the chosen version:
 
 ```bash
+helm repo add jetstack https://charts.jetstack.io && helm repo update jetstack
+
 # Back up cert-manager-managed resources first
 kubectl get certificates,certificaterequests,issuers,clusterissuers,orders,challenges \
   -A -o yaml > cert-manager-backup-$(date +%Y%m%d).yaml
 
-# Server-side apply the target version (static manifest includes CRDs)
-VERSION=v1.11.5   # then v1.17.4 after the 1.25 hop, then latest on 1.36
-kubectl apply --server-side --force-conflicts \
-  -f https://github.com/cert-manager/cert-manager/releases/download/${VERSION}/cert-manager.yaml
+# Example: the first bump, on k8s 1.21 (use --set crds.enabled=true instead for v1.15+)
+helm upgrade --install cert-manager jetstack/cert-manager \
+  --version v1.11.5 --namespace cert-manager \
+  --set installCRDs=true --wait
 
 kubectl rollout status deployment/cert-manager \
   deployment/cert-manager-cainjector \
   deployment/cert-manager-webhook \
   -n cert-manager --timeout=180s
-
-# Confirm all CRDs converged to the new version (no split-brain)
-kubectl get crd -l app.kubernetes.io/name=cert-manager \
-  -o custom-columns=NAME:.metadata.name,VER:.metadata.labels.'app\.kubernetes\.io/version'
 ```
-
-> **Watch for split-brain.** If you ever use plain client-side `kubectl apply` here, the Deployments may update while the two largest CRDs (`challenges`, `certificates`) silently fail — leaving a new controller running against old CRD schemas. The CRD-version check above catches it; server-side apply prevents it.
 
 > **Verify after each step.** The webhook needs ~60–90s to warm up after a rollout — certificate issuance returns `context deadline exceeded` until it's ready, then recovers. Confirm with a self-signed Issuer + Certificate and check it reaches `Ready` (allow ≥90s), or just confirm existing certs stay valid: `kubectl get certificates -A`. The path v1.0.3 → v1.11.5 (on k8s 1.21) → v1.17.4 (on k8s 1.25) was validated end-to-end in the playground, including issuance.
 
@@ -303,7 +299,7 @@ The cloud-init scripts pin the K3s version via `INSTALL_K3S_VERSION=v1.21.6+k3s1
 
 | Risk | Severity | Mitigation | Status |
 |---|---|---|---|
-| cert-manager v1.0.3 runtime compatibility across v1.22 API removals | High | Step cert-manager with the k8s version via server-side apply (v1.11.5 on 1.21 → v1.17.4 on 1.25 → latest on 1.36); never jump to latest on old k8s | Pre-work item 2 |
+| cert-manager v1.0.3 runtime compatibility across v1.22 API removals | High | `helm upgrade` cert-manager in step with the k8s version (v1.11.5 on 1.21 → v1.17.4 on 1.25 → latest on 1.36); never jump to latest on old k8s | Pre-work item 2 |
 | system-upgrade-controller v0.6.2 incompatible with modern K3s upgrade images | High | Upgrade SUC to v0.19.2 first | Pre-work item 1 |
 | PodSecurityPolicy removed at v1.25 | High (if not deleted) | Delete `longhorn-nfs-provisioner` PSP before starting | Pre-work item 3 |
 | Old summerwind ARC v0.17.0 compatibility with K8s 1.22+ | Medium | Test in playground; complete migration to new ARC before upgrade | Needs investigation |

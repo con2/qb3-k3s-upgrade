@@ -3,7 +3,7 @@ version: '3'
 # Recommended workflow (cert-manager tracks the k8s version — see upgrade:cert-manager):
 #   task up                                  # create cluster, mirror prod state
 #   task upgrade:suc                         # pre-work: upgrade SUC
-#   task upgrade:cert-manager -- v1.11.5     # pre-work: cert-manager (k8s 1.21 ceiling)
+#   task upgrade:cert-manager:reinstall -- v1.11.5   # pre-work: cert-manager off v1.0.3 (k8s 1.21 ceiling)
 #   task k3s:upgrade -- v1.25.16+k3s4       # hop 1
 #   task k3s:upgrade:watch                   # watch progress (Ctrl-C when done)
 #   task k3s:health                          # verify before continuing
@@ -145,11 +145,18 @@ tasks:
       - task: mirror:suc
 
   mirror:cert-manager:
-    desc: "Install cert-manager v1.0.3 — intentionally old to mirror production"
+    desc: "Install cert-manager v1.0.3 via Helm — intentionally old, mirrors production (Helm-managed)"
     env:
       KUBECONFIG: "{{.TASKFILE_DIR}}/kubeconfig-orbstack.yaml"
     cmds:
-      - kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.0.3/cert-manager.yaml
+      - helm repo add jetstack https://charts.jetstack.io 2>/dev/null || true
+      - helm repo update jetstack
+      # Production runs cert-manager as a Helm release (chart cert-manager-v1.0.3).
+      # v1.0.3/v1.11.x charts gate CRDs behind installCRDs (renamed to crds.enabled in v1.15).
+      - >
+        helm upgrade --install cert-manager jetstack/cert-manager
+        --version v1.0.3 --namespace cert-manager --create-namespace
+        --set installCRDs=true --wait
       - kubectl rollout status deployment/cert-manager deployment/cert-manager-cainjector deployment/cert-manager-webhook -n cert-manager --timeout=120s
 
   mirror:suc:
@@ -180,28 +187,84 @@ tasks:
           -o jsonpath='{.spec.template.spec.containers[0].image}'
         echo
 
-  # cert-manager must track the Kubernetes version — it cannot leap straight to
-  # latest. Two independent constraints, both learned the hard way in the playground:
+  # cert-manager is Helm-managed (matching production) and must track the
+  # Kubernetes version — it cannot leap straight to latest:
   #   1. The chart enforces kubeVersion >= 1.22, so on k8s 1.21 the newest
   #      installable line is v1.11.x.
-  #   2. cert-manager >= v1.18 ships CRDs that use `selectableFields`, a CRD API
-  #      feature only present in k8s >= 1.30. Installing such CRDs on an older
-  #      k8s fails: client-side apply also blows past the 256KB annotation limit
-  #      on the huge challenges/certificates CRDs; server-side apply fails with
-  #      "selectableFields: field not declared in schema". Stick to a cert-manager
-  #      contemporaneous with the cluster's k8s and only go to latest once on
-  #      a recent k8s.
-  # Always use server-side apply (--server-side --force-conflicts): it is the
-  # supported method for cert-manager's oversized CRDs and avoids the annotation
-  # limit entirely.
+  #   2. cert-manager >= v1.18 ships CRDs using `selectableFields`, a CRD-API
+  #      feature only present in k8s >= 1.30; don't install those on older k8s.
+  # The CRD value flag was renamed from `installCRDs` to `crds.enabled` in chart
+  # v1.15, so these tasks pick the right one based on the target minor version.
+  #
+  # The FIRST move off the ancient v1.0.3 release must use :reinstall — a direct
+  # `helm upgrade` across that 11-minor gap fails on the CRD conversion merge
+  # (cert-manager forbids skipping minor versions). :reinstall backs up the CRs,
+  # uninstalls, installs the target fresh, and restores the CRs. TLS Secrets are
+  # not owner-referenced by Certificates, so they survive the uninstall and TLS
+  # keeps serving with no outage. Subsequent bumps between modern versions use
+  # the plain `upgrade:cert-manager` (helm upgrade).
   #
   # Recommended targets per stop on the 1.21 -> 1.36 journey:
-  #   on k8s 1.21 (before first hop):  task upgrade:cert-manager -- v1.11.5
+  #   on k8s 1.21 (before first hop):  task upgrade:cert-manager:reinstall -- v1.11.5
   #   on k8s 1.25 (after first hop):   task upgrade:cert-manager -- v1.17.4
-  #   on k8s 1.36 (final):             task upgrade:cert-manager -- v1.18.2   (or latest)
+  #   on k8s 1.36 (final):             task upgrade:cert-manager -- v1.18.2   (or later)
+
+  upgrade:cert-manager:reinstall:
+    desc: "Reinstall cert-manager at TARGET preserving CRs (use for the initial jump off v1.0.3). Usage: task upgrade:cert-manager:reinstall -- v1.11.5"
+    vars:
+      TARGET: '{{.CLI_ARGS | trim}}'
+    preconditions:
+      - sh: test -n "{{.TARGET}}"
+        msg: "Usage: task upgrade:cert-manager:reinstall -- v1.11.5"
+    env:
+      KUBECONFIG: "{{.TASKFILE_DIR}}/kubeconfig-orbstack.yaml"
+    cmds:
+      - helm repo add jetstack https://charts.jetstack.io 2>/dev/null || true
+      - helm repo update jetstack
+      # 1. Back up all CRs (stripped of cluster-specific metadata + status).
+      #    TLS Secrets are NOT owner-referenced, so they survive on their own.
+      - |
+        python3 - <<'PY'
+        import subprocess, json
+        raw = subprocess.check_output(["kubectl","get","issuers,clusterissuers,certificates","-A","-o","json"])
+        d = json.loads(raw); out = []
+        for it in d.get("items", []):
+            m = it["metadata"]
+            for k in ["resourceVersion","uid","creationTimestamp","generation","managedFields","ownerReferences"]:
+                m.pop(k, None)
+            if m.get("annotations"):
+                m["annotations"].pop("kubectl.kubernetes.io/last-applied-configuration", None)
+            it.pop("status", None)
+            out.append(it)
+        json.dump({"apiVersion":"v1","kind":"List","items":out}, open("{{.TEMP_DIR}}/cm-cr-backup.json","w"))
+        print(f"Backed up {len(out)} cert-manager CRs to {{.TEMP_DIR}}/cm-cr-backup.json")
+        PY
+      # 2. Uninstall the old release (controller + CRDs + CRs deleted; TLS Secrets persist)
+      - helm uninstall cert-manager -n cert-manager
+      # 3. Install the target version fresh (recreates CRDs at the new schema)
+      - |
+        TARGET="{{.TARGET}}"
+        MINOR=$(echo "$TARGET" | sed -E 's/^v1\.([0-9]+)\..*/\1/')
+        if [ "$MINOR" -le 14 ]; then CRD_FLAG="--set installCRDs=true"; else CRD_FLAG="--set crds.enabled=true"; fi
+        echo "Installing cert-manager ${TARGET} fresh (${CRD_FLAG})..."
+        helm install cert-manager jetstack/cert-manager \
+          --version "$TARGET" --namespace cert-manager --create-namespace \
+          $CRD_FLAG --wait --timeout 180s
+      # 4. Restore the CRs (retry through webhook warmup); certs go Ready against surviving Secrets
+      - |
+        for i in 1 2 3 4 5 6; do
+          if kubectl apply -f {{.TEMP_DIR}}/cm-cr-backup.json 2>/dev/null; then echo "CRs restored."; break; fi
+          echo "waiting for cert-manager webhook to warm up... ($i)"; sleep 10
+        done
+      - kubectl rollout status deployment/cert-manager deployment/cert-manager-cainjector deployment/cert-manager-webhook -n cert-manager --timeout=180s
+      - |
+        echo "cert-manager version now:"
+        kubectl get deployment cert-manager -n cert-manager \
+          -o jsonpath='{.spec.template.spec.containers[0].image}'
+        echo
 
   upgrade:cert-manager:
-    desc: "Upgrade cert-manager to a target version (server-side apply). Usage: task upgrade:cert-manager -- v1.17.4"
+    desc: "Upgrade the cert-manager Helm release to a target version (modern versions only). Usage: task upgrade:cert-manager -- v1.17.4"
     vars:
       TARGET: '{{.CLI_ARGS | trim}}'
     preconditions:
@@ -210,11 +273,21 @@ tasks:
     env:
       KUBECONFIG: "{{.TASKFILE_DIR}}/kubeconfig-orbstack.yaml"
     cmds:
+      - helm repo add jetstack https://charts.jetstack.io 2>/dev/null || true
+      - helm repo update jetstack
       - |
         kubectl get certificates,certificaterequests,issuers,clusterissuers -A -o yaml \
           > {{.TEMP_DIR}}/cert-manager-backup.yaml 2>/dev/null || true
         echo "Backup written to {{.TEMP_DIR}}/cert-manager-backup.yaml"
-      - kubectl apply --server-side --force-conflicts -f https://github.com/cert-manager/cert-manager/releases/download/{{.TARGET}}/cert-manager.yaml
+      - |
+        TARGET="{{.TARGET}}"
+        MINOR=$(echo "$TARGET" | sed -E 's/^v1\.([0-9]+)\..*/\1/')
+        # CRD flag renamed installCRDs -> crds.enabled at chart v1.15
+        if [ "$MINOR" -le 14 ]; then CRD_FLAG="--set installCRDs=true"; else CRD_FLAG="--set crds.enabled=true"; fi
+        echo "Upgrading cert-manager Helm release to ${TARGET} (${CRD_FLAG})..."
+        helm upgrade --install cert-manager jetstack/cert-manager \
+          --version "$TARGET" --namespace cert-manager --create-namespace \
+          $CRD_FLAG --wait
       - kubectl rollout status deployment/cert-manager deployment/cert-manager-cainjector deployment/cert-manager-webhook -n cert-manager --timeout=180s
       - |
         echo "cert-manager version now:"
