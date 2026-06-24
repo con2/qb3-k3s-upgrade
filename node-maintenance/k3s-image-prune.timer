@@ -1,0 +1,13 @@
+[Unit]
+Description=Weekly prune of unused k3s/containerd images
+
+[Timer]
+OnCalendar=Sun 04:00
+# Run on next boot if the node was off at the scheduled time.
+Persistent=true
+# Each node picks its own random offset (0–1h), so the three etcd nodes
+# never prune simultaneously — avoids a coordinated I/O hit on etcd.
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target

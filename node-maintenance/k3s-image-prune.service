@@ -1,0 +1,15 @@
+[Unit]
+Description=Prune unused k3s/containerd images
+Documentation=https://github.com/.../k3s-upgrade  # WRITEUP.md "Follow-ups"
+# Ordering only — harmless if one of these units doesn't exist on this node
+# (server nodes have k3s.service, agents have k3s-agent.service).
+After=k3s.service k3s-agent.service
+
+[Service]
+Type=oneshot
+# --timeout (a global crictl flag, before the subcommand) must be generous:
+# the default ~2s times out on a busy disk and leaves removals incomplete.
+ExecStart=/usr/local/bin/k3s crictl --timeout 10m rmi --prune
+# Be gentle so the prune never starves etcd / workload I/O on the shared SSD.
+Nice=19
+IOSchedulingClass=idle
