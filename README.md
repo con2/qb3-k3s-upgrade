@@ -72,44 +72,34 @@ kubectl rollout status deployment/system-upgrade-controller -n system-upgrade
 
 > **Why delete the ClusterRoleBinding first?** v0.6.2 binds the `system-upgrade` ServiceAccount to `cluster-admin`; v0.19.2 rebinds it to a scoped `system-upgrade-controller` role. A binding's `roleRef` is immutable, so `kubectl apply` fails with `cannot change roleRef` on that object (the Deployment still updates, but the task exits non-zero and RBAC stays on the old `cluster-admin` binding). Deleting the binding first lets the new, correctly-scoped one be created. Verified in the playground.
 
-### 2. Upgrade cert-manager — tracking the Kubernetes version
+### 2. Remove cert-manager for the duration of the upgrade
 
-cert-manager v1.0.3 is 4.5 years old and is **managed as a Helm release** (`helm ls -n cert-manager` shows the `cert-manager-v1.0.3` chart). Its cainjector patches webhook CA bundles at runtime; if it calls any API removed in v1.22 during the upgrade window, TLS breaks for every service on the cluster. So it must be modernised as the cluster moves — but **it cannot leap straight to latest.** cert-manager must track the Kubernetes version, bumped via `helm upgrade` after each hop. Two independent constraints, both found in the playground:
+cert-manager v1.0.3 is 4.5 years old and is **managed as a Helm release** (`helm ls -n cert-manager` shows the `cert-manager-v1.0.3` chart). Rather than dragging it up version-by-version alongside Kubernetes, **remove it entirely before the hops and install a current version fresh at the end.** This is the simplest, lowest-risk path, and the playground proved out every assumption behind it:
 
-1. **Lower gate — the chart's `kubeVersion`.** The chart refuses to install on too-old a cluster. Verified floors: 1.10.x needs ≥ 1.20; **1.11.x needs ≥ 1.21** (the newest line that runs on 1.21); 1.12.x and later need ≥ 1.22.
-2. **Upper gate — `selectableFields` in the CRDs.** cert-manager **≥ v1.18** ships CRDs using `selectableFields`, a CRD-API feature only present in **k8s ≥ 1.30**. Don't install cert-manager ≥ v1.18 until the cluster is on k8s ≥ 1.30.
+- **No TLS outage.** cert-manager does **not** owner-reference the TLS Secrets it creates, so they survive `helm uninstall` and the CRD deletion. ingress-nginx reads those Secrets directly, so HTTPS for every site keeps serving with cert-manager absent. *Verified: the Secret stayed byte-identical across all three k3s hops.*
+- **Nothing to break on newer k8s.** Leaving v1.0.3 running is actively unsafe — its **cainjector crash-loops as early as k8s 1.25** (verified). Removing it means there is no controller, webhook, or conversion webhook to misbehave, and no CRD version-skip/merge problems during the hops.
+- **Only cost: no issuance/renewal during the window.** Keep the maintenance window bounded and confirm no certificate is near expiry before you start (Let's Encrypt renews at ~⅔ of a 90-day life, so a window of hours/days is safe).
 
-Recommended targets along the 1.21 → 1.36 journey (each run via `helm upgrade` after reaching that k8s):
+Why not upgrade it in place instead? Two hard gates make a rolling cert-manager upgrade painful, and removal sidesteps both: the chart's `kubeVersion` floor (v1.12+ refuse to install below k8s 1.22, so you can't reach a modern version while on 1.21), and `selectableFields` in cert-manager ≥ v1.18 CRDs (a CRD-API feature requiring k8s ≥ 1.30). Off the cluster entirely, neither applies until the final install on k8s 1.36.
 
-| cluster on k8s | cert-manager target | why |
-|---|---|---|
-| 1.21 (before first hop) | **v1.11.5** | newest that installs on 1.21; survives the v1.22 API removals |
-| 1.25 (after first hop) | **v1.17.4** | newest without `selectableFields`; spans 1.25 → 1.29 |
-| 1.36 (final) | **latest** (≥ v1.18) | k8s now supports `selectableFields` |
-
-> **The CRD value flag was renamed.** Charts ≤ v1.14 gate CRDs behind `--set installCRDs=true`; v1.15+ use `--set crds.enabled=true`. So the first two bumps use `installCRDs`, the final one uses `crds.enabled`. (The Taskfile's `upgrade:cert-manager` picks the right flag automatically from the target version.)
-
-Each step — back up, then `helm upgrade` to the chosen version:
+**Now (on k8s 1.21), back up the CRs and uninstall:**
 
 ```bash
-helm repo add jetstack https://charts.jetstack.io && helm repo update jetstack
+# Back up the CR objects (Issuers/ClusterIssuers/Certificates). The TLS Secrets
+# are NOT backed up — they persist on their own and keep serving.
+kubectl get issuers,clusterissuers,certificates -A -o yaml \
+  > cert-manager-crs-$(date +%Y%m%d).yaml
 
-# Back up cert-manager-managed resources first
-kubectl get certificates,certificaterequests,issuers,clusterissuers,orders,challenges \
-  -A -o yaml > cert-manager-backup-$(date +%Y%m%d).yaml
+# Remove cert-manager (controller + webhooks + CRDs + CRs deleted; Secrets stay)
+helm uninstall cert-manager -n cert-manager
 
-# Example: the first bump, on k8s 1.21 (use --set crds.enabled=true instead for v1.15+)
-helm upgrade --install cert-manager jetstack/cert-manager \
-  --version v1.11.5 --namespace cert-manager \
-  --set installCRDs=true --wait
-
-kubectl rollout status deployment/cert-manager \
-  deployment/cert-manager-cainjector \
-  deployment/cert-manager-webhook \
-  -n cert-manager --timeout=180s
+# Confirm: no cert-manager pods/CRDs, but the TLS Secrets remain
+kubectl get pods -n cert-manager 2>/dev/null
+kubectl get crd | grep cert-manager.io || echo "no cert-manager CRDs (expected)"
+kubectl get secret -A | grep -E 'kubernetes.io/tls' | head
 ```
 
-> **Verify after each step.** The webhook needs ~60–90s to warm up after a rollout — certificate issuance returns `context deadline exceeded` until it's ready, then recovers. Confirm with a self-signed Issuer + Certificate and check it reaches `Ready` (allow ≥90s), or just confirm existing certs stay valid: `kubectl get certificates -A`. The path v1.0.3 → v1.11.5 (on k8s 1.21) → v1.17.4 (on k8s 1.25) was validated end-to-end in the playground, including issuance.
+> The reinstall happens at the **end**, on k8s 1.36 — see [§ Reinstall cert-manager](#reinstall-cert-manager-after-the-final-hop). The Taskfile encodes both halves as `cert-manager:remove` and `cert-manager:install -- <version>`.
 
 ### 3. Remove ghost Longhorn resources
 
@@ -185,7 +175,7 @@ v1.21.6+k3s1  →  v1.25.x  →  v1.29.x  →  v1.36.1+k3s1
 
 ### Why these stops
 
-- **v1.25** is the boundary where `policy/v1beta1` (PodSecurityPolicy) and `batch/v1beta1` CronJobs are removed. The PSP will already be deleted and all CronJobs already use `batch/v1`, so this stop is a verification checkpoint, not a migration step. Confirm cert-manager, ingress-nginx, and all application services are healthy before continuing. **This is also where cert-manager gets its next bump** (pre-work item 2): the cluster is now on k8s 1.25, so move cert-manager to v1.17.4.
+- **v1.25** is the boundary where `policy/v1beta1` (PodSecurityPolicy) and `batch/v1beta1` CronJobs are removed. The PSP will already be deleted and all CronJobs already use `batch/v1`, so this stop is a verification checkpoint, not a migration step. Confirm ingress-nginx and all application services are healthy before continuing. (cert-manager is absent for the whole journey — see pre-work item 2 — so existing TLS keeps serving from the retained Secrets, and there's nothing cert-manager-shaped to verify here.)
 
 - **v1.29** crosses the v1.26 removal of `autoscaling/v2beta2` HPA (no HPAs exist in this cluster) and several flow-control API promotions. A second verification point before the final jump.
 
@@ -267,6 +257,34 @@ curl -sI https://kompassi.eu | head -1
 
 ---
 
+## Reinstall cert-manager after the final hop
+
+Once the cluster is on **k8s 1.36** and healthy, install a current cert-manager and restore the CR objects backed up in pre-work item 2. By now both version gates are satisfied (k8s ≥ 1.22 for the chart, ≥ 1.30 for `selectableFields`), so the latest release installs cleanly.
+
+```bash
+helm repo add jetstack https://charts.jetstack.io && helm repo update jetstack
+
+# Install current cert-manager. v1.15+ use crds.enabled (older charts used installCRDs).
+helm install cert-manager jetstack/cert-manager \
+  --version v1.18.2 --namespace cert-manager --create-namespace \
+  --set crds.enabled=true --wait --timeout 180s
+
+# Restore the CR objects (retry while the webhook warms up ~60–90s)
+kubectl apply -f cert-manager-crs-*.yaml
+```
+
+cert-manager reconciles each restored Certificate against its **surviving** TLS Secret and marks it `Ready` without re-issuing — no new ACME orders, no churn. Verify:
+
+```bash
+kubectl rollout status deployment/cert-manager deployment/cert-manager-cainjector \
+  deployment/cert-manager-webhook -n cert-manager --timeout=180s
+kubectl get certificates -A          # all Ready
+```
+
+> **Validated end-to-end in the playground:** remove cert-manager on k8s 1.21, hop 1.21→1.25→1.29→1.36 with no cert-manager present (TLS Secret byte-identical the whole way), then install current cert-manager and restore CRs — all Certificates returned to `Ready` against the retained Secrets.
+
+---
+
 ## Testing in OrbStack
 
 This repo's Taskfile spins up an OrbStack VM cluster that replicates the production starting state: K3s v1.21.6+k3s1, cert-manager v1.0.3, and system-upgrade-controller v0.6.2. Use it to run through the full upgrade sequence before touching production.
@@ -275,18 +293,17 @@ This repo's Taskfile spins up an OrbStack VM cluster that replicates the product
 task up          # create VMs + fetch kubeconfig + mirror production state
 task k3s:status  # confirm starting version
 
-task upgrade:suc                       # SUC -> v0.19.2
-task upgrade:cert-manager -- v1.11.5   # cert-manager (k8s 1.21 ceiling)
+task upgrade:suc                     # SUC -> v0.19.2
+task cert-manager:remove             # back up CRs + uninstall cert-manager (TLS Secrets persist)
 
-task k3s:upgrade -- v1.25.16+k3s4   # first hop
+task k3s:upgrade -- v1.25.16+k3s4   # first hop  (cluster runs bare)
 task k3s:upgrade:watch               # follow progress
 task k3s:health                      # verify
 
-task upgrade:cert-manager -- v1.17.4   # now on k8s 1.25: bump cert-manager
-
 task k3s:upgrade -- v1.29.14+k3s1   # second hop
 task k3s:upgrade -- v1.36.1+k3s1    # final hop
-task upgrade:cert-manager -- v1.18.2   # now on k8s 1.36: cert-manager -> latest
+
+task cert-manager:install -- v1.18.2 # on k8s 1.36: install current cert-manager + restore CRs
 
 task down        # tear down when done
 ```
@@ -299,7 +316,7 @@ The cloud-init scripts pin the K3s version via `INSTALL_K3S_VERSION=v1.21.6+k3s1
 
 | Risk | Severity | Mitigation | Status |
 |---|---|---|---|
-| cert-manager v1.0.3 runtime compatibility across v1.22 API removals | High | `helm upgrade` cert-manager in step with the k8s version (v1.11.5 on 1.21 → v1.17.4 on 1.25 → latest on 1.36); never jump to latest on old k8s | Pre-work item 2 |
+| cert-manager v1.0.3 incompatible with newer k8s (cainjector crash-loops by 1.25) | High | Remove cert-manager before the hops, run bare (TLS Secrets keep serving), install current cert-manager fresh on k8s 1.36 | Pre-work item 2 + reinstall step |
 | system-upgrade-controller v0.6.2 incompatible with modern K3s upgrade images | High | Upgrade SUC to v0.19.2 first | Pre-work item 1 |
 | PodSecurityPolicy removed at v1.25 | High (if not deleted) | Delete `longhorn-nfs-provisioner` PSP before starting | Pre-work item 3 |
 | Old summerwind ARC v0.17.0 compatibility with K8s 1.22+ | Medium | Test in playground; complete migration to new ARC before upgrade | Needs investigation |
