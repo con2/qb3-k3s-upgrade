@@ -152,6 +152,8 @@ tasks:
       KUBECONFIG: "{{.TASKFILE_DIR}}/kubeconfig-orbstack.yaml"
     cmds:
       - kubectl apply -f https://raw.githubusercontent.com/rancher/system-upgrade-controller/v0.6.2/manifests/system-upgrade-controller.yaml
+      # The v0.6.2 tag's manifest pins the older v0.5.0 image; production runs v0.6.2, so pin it to match.
+      - kubectl set image deployment/system-upgrade-controller -n system-upgrade system-upgrade-controller=rancher/system-upgrade-controller:v0.6.2
       - kubectl rollout status deployment/system-upgrade-controller -n system-upgrade --timeout=60s
 
   # ── Pre-upgrade component upgrades ────────────────────────────────────────────
