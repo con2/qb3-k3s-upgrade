@@ -310,6 +310,24 @@ task down        # tear down when done
 
 The cloud-init scripts pin the K3s version via `INSTALL_K3S_VERSION=v1.21.6+k3s1` passed to the K3s installer, giving a faithful replica of the production starting point.
 
+## Running the procedure against production
+
+The procedure tasks — `upgrade:suc`, `cert-manager:remove`, `k3s:upgrade -- <ver>`, `k3s:upgrade:watch`, `k3s:health`, `cert-manager:install -- <ver>`, `k3s:status` — are cluster-agnostic. They default to the OrbStack playground kubeconfig but honor an exported `KUBECONFIG`, so the same commands you rehearsed run against production by pointing them at the prod kubeconfig:
+
+```bash
+export KUBECONFIG=/path/to/qb     # production kubeconfig; unset to fall back to the playground
+
+task upgrade:suc
+task cert-manager:remove
+task k3s:upgrade -- v1.25.16+k3s4
+# ... watch / health / remaining hops ...
+task cert-manager:install -- v1.18.2
+```
+
+- **Default is the playground.** With `KUBECONFIG` unset, every task uses `kubeconfig-orbstack.yaml`, so you can't hit production by accident — you must explicitly point at it.
+- **Playground-only tasks are fenced off.** `up`, `down`, `vms:*`, `k3s:kubeconfig` only ever touch OrbStack, and `mirror:cert-manager` / `mirror:suc` (which install the intentionally-old versions) **refuse to run unless the target server is `*.orb.local`** — so they can never downgrade production.
+- The `cert-manager:remove` backup file (`/tmp/cm-cr-backup.json`) is written on the machine running `task`, and `cert-manager:install` reads it there; run both from the same workstation.
+
 ---
 
 ## Risk Register
