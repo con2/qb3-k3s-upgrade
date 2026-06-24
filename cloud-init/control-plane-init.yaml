@@ -5,5 +5,5 @@ runcmd:
     curl -sfL https://get.k3s.io \
       | K3S_TOKEN='${K3S_TOKEN}' \
         INSTALL_K3S_VERSION='v1.21.6+k3s1' \
-        INSTALL_K3S_EXEC="server --tls-san upgr-cp.orb.local --tls-san ${IP} --advertise-address=${IP} --node-ip=${IP}" \
+        INSTALL_K3S_EXEC="server --cluster-init --tls-san upgr-cp1.orb.local --tls-san ${IP} --advertise-address=${IP} --node-ip=${IP}" \
         sh -s -

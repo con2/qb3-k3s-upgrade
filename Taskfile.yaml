@@ -41,40 +41,50 @@ tasks:
   # ── VM management ─────────────────────────────────────────────────────────────
 
   vms:create:
-    desc: Create OrbStack VMs (skips existing); K3s v1.21.6+k3s1 is provisioned via cloud-init at boot
+    desc: "Create OrbStack VMs (skips existing): 3 control-plane nodes + 1 worker, K3s v1.21.6+k3s1"
     cmds:
       - |
         [ -f .cluster-token ] || openssl rand -hex 32 > .cluster-token
         export K3S_TOKEN=$(cat .cluster-token)
 
-        if ! orb list | awk '{print $1}' | grep -q '^upgr-cp$'; then
-          envsubst '$K3S_TOKEN' < cloud-init/control-plane.yaml \
-            > {{.TEMP_DIR}}/cloud-init-cp.yaml
-          orb create ubuntu upgr-cp --user-data "{{.TEMP_DIR}}/cloud-init-cp.yaml"
+        # First control-plane: initialises the embedded etcd cluster (--cluster-init)
+        if ! orb list | awk '{print $1}' | grep -q '^upgr-cp1$'; then
+          envsubst '$K3S_TOKEN' < cloud-init/control-plane-init.yaml \
+            > {{.TEMP_DIR}}/cloud-init-cp1.yaml
+          orb create ubuntu upgr-cp1 --user-data "{{.TEMP_DIR}}/cloud-init-cp1.yaml"
         fi
 
-        echo "Waiting for k3s to be active on upgr-cp..."
-        until orb run -m upgr-cp systemctl is-active k3s 2>/dev/null | grep -q "^active"; do
+        echo "Waiting for k3s to be active on upgr-cp1..."
+        until orb run -m upgr-cp1 systemctl is-active k3s 2>/dev/null | grep -q "^active"; do
           sleep 3
         done
 
-        export CP_IP=$(orb list | awk '/^upgr-cp/{print $NF}')
+        export CP_IP=$(orb list | awk '/^upgr-cp1/{print $NF}')
         echo "Control plane IP: ${CP_IP}"
 
-        for W in upgr-w1 upgr-w2; do
-          if ! orb list | awk '{print $1}' | grep -q "^${W}$"; then
-            envsubst '$K3S_TOKEN $CP_IP' < cloud-init/worker.yaml \
-              > {{.TEMP_DIR}}/cloud-init-${W}.yaml
-            orb create ubuntu "$W" --user-data "{{.TEMP_DIR}}/cloud-init-${W}.yaml"
+        # Additional control-plane nodes: join the existing etcd cluster
+        for CP in upgr-cp2 upgr-cp3; do
+          if ! orb list | awk '{print $1}' | grep -q "^${CP}$"; then
+            envsubst '$K3S_TOKEN $CP_IP' < cloud-init/control-plane-join.yaml \
+              > {{.TEMP_DIR}}/cloud-init-${CP}.yaml
+            orb create ubuntu "$CP" --user-data "{{.TEMP_DIR}}/cloud-init-${CP}.yaml"
           fi
         done
+
+        # Worker node
+        if ! orb list | awk '{print $1}' | grep -q '^upgr-w1$'; then
+          envsubst '$K3S_TOKEN $CP_IP' < cloud-init/worker.yaml \
+            > {{.TEMP_DIR}}/cloud-init-w1.yaml
+          orb create ubuntu upgr-w1 --user-data "{{.TEMP_DIR}}/cloud-init-w1.yaml"
+        fi
 
   vms:delete:
     desc: Delete all OrbStack VMs
     cmds:
-      - orb delete -f upgr-cp || true
+      - orb delete -f upgr-cp1 || true
+      - orb delete -f upgr-cp2 || true
+      - orb delete -f upgr-cp3 || true
       - orb delete -f upgr-w1 || true
-      - orb delete -f upgr-w2 || true
 
   # ── Kubeconfig ────────────────────────────────────────────────────────────────
 
@@ -82,8 +92,8 @@ tasks:
     desc: Fetch kubeconfig from control plane, write kubeconfig-orbstack.yaml
     cmds:
       - >
-        orb run -m upgr-cp -u root cat /etc/rancher/k3s/k3s.yaml
-        | sed 's|server: https://127.0.0.1:6443|server: https://upgr-cp.orb.local:6443|'
+        orb run -m upgr-cp1 -u root cat /etc/rancher/k3s/k3s.yaml
+        | sed 's|server: https://127.0.0.1:6443|server: https://upgr-cp1.orb.local:6443|'
         > kubeconfig-orbstack.yaml
     generates:
       - kubeconfig-orbstack.yaml

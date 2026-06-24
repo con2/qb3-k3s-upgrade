@@ -1,0 +1,10 @@
+#cloud-config
+runcmd:
+  - |
+    IP=$(hostname -I | awk '{print $1}')
+    curl -sfL https://get.k3s.io \
+      | K3S_TOKEN='${K3S_TOKEN}' \
+        K3S_URL='https://${CP_IP}:6443' \
+        INSTALL_K3S_VERSION='v1.21.6+k3s1' \
+        INSTALL_K3S_EXEC="server --node-ip=${IP}" \
+        sh -s -
