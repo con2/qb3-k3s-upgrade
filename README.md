@@ -2,7 +2,7 @@
 
 Tooling and documentation for upgrading the `qb` K3s cluster from v1.21.6 to v1.36.1, rehearsed on a disposable OrbStack cluster before running against production.
 
-- **[WRITEUP.md](WRITEUP.md)** — what happened: the approach, the production run, the two incidents (cgroup v1→v2, Azure disk-mount swap) and how they were handled, the outcome, and follow-ups. Start here.
+- **[WRITEUP.md](WRITEUP.md)** — what happened: the approach, the production run, the two incidents (cgroup v1→v2, Hyper-V disk-mount swap) and how they were handled, the outcome, and follow-ups. Start here.
 - **[PLAN.md](PLAN.md)** — the original pre-upgrade assessment and the step-by-step procedure (pre-work, the staged hops, cert-manager handling, risk register).
 
 ## The repo

@@ -15,7 +15,7 @@ The production cluster (`qb`) runs K3s v1.21.6+k3s1 — 15 minor versions behind
 | K3s version | v1.21.6+k3s1 (November 2021) |
 | Kubernetes gap | 15 minor versions to v1.36.1 |
 | Nodes | qb1–qb3: etcd/control-plane · qb4: worker |
-| OS | Ubuntu 20.04 (Azure), kernel 5.15 |
+| OS | Ubuntu 20.04 on Hyper-V, kernel 5.15 (`linux-azure` flavour — Hyper-V-tuned; the `-azure` in `uname` is the kernel build, not the cloud) |
 | system-upgrade-controller | v0.6.2 (latest: v0.19.2) |
 | cert-manager | v1.0.3 (upgraded in steps — see pre-work item 2) |
 | ingress-nginx | v1.12.1 — modern, already supports K8s 1.32+ |

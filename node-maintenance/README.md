@@ -1,6 +1,6 @@
 # node-maintenance
 
-Host-level (systemd) maintenance units for the `qb` nodes — applied directly on each Azure VM, not via Kubernetes.
+Host-level (systemd) maintenance units for the `qb` nodes — applied directly on each Hyper-V VM, not via Kubernetes.
 
 ## k3s-image-prune (weekly image GC)
 

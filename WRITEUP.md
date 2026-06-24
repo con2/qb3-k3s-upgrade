@@ -1,6 +1,6 @@
 # K3s Upgrade Write-up: qb cluster, v1.21.6 → v1.36.1
 
-**Date:** 2026-06-24 · **Cluster:** `qb` (4 nodes, Azure, Ubuntu 20.04) · **Outcome:** ✅ success; limited end-user impact (one full outage during an incident — see below)
+**Date:** 2026-06-24 · **Cluster:** `qb` (4 nodes, Hyper-V, Ubuntu 20.04) · **Outcome:** ✅ success; limited end-user impact (one full outage during an incident — see below)
 
 ## TL;DR
 
@@ -8,7 +8,7 @@ The production cluster had been stuck on K3s **v1.21.6+k3s1** (Kubernetes 1.21, 
 
 All four nodes are now on **v1.36.1+k3s1** (containerd 2.2.3), etcd quorum healthy, all workloads running. Removing cert-manager for the duration caused **no certificate impact** — TLS Secrets persist independently of cert-manager, so existing HTTPS kept working. **End-user impact was limited overall, but not zero:** the disk-swap incident on qb2 caused a full services outage for its duration because public DNS points at qb2 (a known ingress single-point-of-failure) — details under [End-user impact](#end-user-impact).
 
-Two incidents occurred during the production run (a cgroup v1→v2 incompatibility and an Azure disk-mount swap that masqueraded as etcd data loss). Both were resolved without data loss; neither was reproducible in the playground because both are OS/hardware-level. They are the most useful part of this write-up.
+Two incidents occurred during the production run (a cgroup v1→v2 incompatibility and a Hyper-V disk-mount swap that masqueraded as etcd data loss). Both were resolved without data loss; neither was reproducible in the playground because both are OS/hardware-level. They are the most useful part of this write-up.
 
 ## Why this was non-trivial
 
@@ -55,11 +55,11 @@ On the final hop, qb1's kubelet died on startup with `kubelet is configured to n
 
 The playground missed this because OrbStack VMs already run a modern kernel on cgroup v2.
 
-### 2. Azure disk reordering swapped a node's mounts (looked like etcd loss)
+### 2. Hyper-V disk reordering swapped a node's mounts (looked like etcd loss)
 
 When qb2 rebooted for the cgroup-v2 change, its k3s crash-looped with `etcd cluster join failed: duplicate node name found` and an *empty* `/var/lib/rancher`. It looked like the etcd data was gone.
 
-Root cause: `/etc/fstab` mounted the data disks by **unstable `/dev/sdX` names**, and Azure had reordered the disks across the reboot — so the wrong (empty 1000G) disk got mounted at `/var/lib/rancher`, and the real 100G rancher+etcd disk landed at `/mnt/big`. The data was never lost, just mis-mounted.
+Root cause: `/etc/fstab` mounted the data disks by **unstable `/dev/sdX` names**, and Hyper-V had reordered the SCSI disks across the reboot — so the wrong (empty 1000G) disk got mounted at `/var/lib/rancher`, and the real 100G rancher+etcd disk landed at `/mnt/big`. The data was never lost, just mis-mounted.
 
 **Fix:** remount the correct disk (by UUID) at `/var/lib/rancher` and rewrite fstab to use `UUID=` for the data mounts. k3s then rejoined as its *existing* etcd member (the data carried the right member ID, and the failed "fresh join" attempts had never actually altered cluster membership) — no etcd surgery, no data loss. We then UUID-pinned fstab on **all** nodes before any further reboots.
 
@@ -92,7 +92,7 @@ Limited, but not zero:
 ## Lessons
 
 - **Rehearse on a faithful replica** — it caught four real failure modes before prod. But know its blind spots: a playground on a different OS/kernel can't surface OS-level issues (cgroup version, disk/mount behaviour). Both prod incidents were exactly there.
-- **Mount data disks by UUID, never `/dev/sdX`** — especially on cloud VMs that reorder disks across reboots.
+- **Mount data disks by UUID, never `/dev/sdX`** — especially on Hyper-V / VM platforms that can reorder SCSI disks across reboots.
 - **TLS Secrets outlive cert-manager** — that fact made the "remove it for the duration" strategy safe and turned cert-manager from a blocker into a non-event.
 - **One etcd node at a time, and never tunnel your kube-API through a node you're about to reboot** (we lost API access mid-incident when the SSH tunnel ran through the node being recovered).
 - **Staged hops with quorum awareness** kept a multi-version jump safe even when a node fell over mid-upgrade.
