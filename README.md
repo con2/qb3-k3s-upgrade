@@ -60,12 +60,17 @@ The SUC is the tool that performs the K3s upgrade itself. v0.6.2 is four years o
 kubectl get deployment system-upgrade-controller -n system-upgrade \
   -o jsonpath='{.spec.template.spec.containers[0].image}'
 
+# Delete the old ClusterRoleBinding first — see note below
+kubectl delete clusterrolebinding system-upgrade --ignore-not-found
+
 # Apply the new release — CRDs are bundled in the manifest
 kubectl apply -f https://github.com/rancher/system-upgrade-controller/releases/download/v0.19.2/system-upgrade-controller.yaml
 
 # Wait for rollout
 kubectl rollout status deployment/system-upgrade-controller -n system-upgrade
 ```
+
+> **Why delete the ClusterRoleBinding first?** v0.6.2 binds the `system-upgrade` ServiceAccount to `cluster-admin`; v0.19.2 rebinds it to a scoped `system-upgrade-controller` role. A binding's `roleRef` is immutable, so `kubectl apply` fails with `cannot change roleRef` on that object (the Deployment still updates, but the task exits non-zero and RBAC stays on the old `cluster-admin` binding). Deleting the binding first lets the new, correctly-scoped one be created. Verified in the playground.
 
 ### 2. Upgrade cert-manager (v1.0.3 → v1.17.x)
 

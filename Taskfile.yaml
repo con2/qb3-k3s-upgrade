@@ -163,6 +163,9 @@ tasks:
     env:
       KUBECONFIG: "{{.TASKFILE_DIR}}/kubeconfig-orbstack.yaml"
     cmds:
+      # The v0.6.2 binding points at cluster-admin; v0.19.2 rebinds it to a scoped role.
+      # roleRef is immutable, so the old ClusterRoleBinding must be deleted before apply.
+      - kubectl delete clusterrolebinding system-upgrade --ignore-not-found
       - kubectl apply -f https://github.com/rancher/system-upgrade-controller/releases/download/v0.19.2/system-upgrade-controller.yaml
       - kubectl rollout status deployment/system-upgrade-controller -n system-upgrade --timeout=120s
       - |
