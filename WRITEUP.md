@@ -1,12 +1,12 @@
 # K3s Upgrade Write-up: qb cluster, v1.21.6 → v1.36.1
 
-**Date:** 2026-06-24 · **Cluster:** `qb` (4 nodes, Azure, Ubuntu 20.04) · **Outcome:** ✅ success, no TLS outage
+**Date:** 2026-06-24 · **Cluster:** `qb` (4 nodes, Azure, Ubuntu 20.04) · **Outcome:** ✅ success; limited end-user impact (one full outage during an incident — see below)
 
 ## TL;DR
 
 The production cluster had been stuck on K3s **v1.21.6+k3s1** (Kubernetes 1.21, ~4.5 years old) for a long time. We upgraded it to **v1.36.1+k3s1** — 15 minor versions — in staged hops via the system-upgrade-controller, after rehearsing the entire procedure on a throwaway OrbStack cluster.
 
-All four nodes are now on **v1.36.1+k3s1** (containerd 2.2.3), etcd quorum healthy, all workloads running. **HTTPS served continuously throughout** — there was no user-facing outage, even though cert-manager was deliberately absent for the duration of the upgrade.
+All four nodes are now on **v1.36.1+k3s1** (containerd 2.2.3), etcd quorum healthy, all workloads running. Removing cert-manager for the duration caused **no certificate impact** — TLS Secrets persist independently of cert-manager, so existing HTTPS kept working. **End-user impact was limited overall, but not zero:** the disk-swap incident on qb2 caused a full services outage for its duration because public DNS points at qb2 (a known ingress single-point-of-failure) — details under [End-user impact](#end-user-impact).
 
 Two incidents occurred during the production run (a cgroup v1→v2 incompatibility and an Azure disk-mount swap that masqueraded as etcd data loss). Both were resolved without data loss; neither was reproducible in the playground because both are OS/hardware-level. They are the most useful part of this write-up.
 
@@ -70,7 +70,16 @@ Throughout this, etcd quorum held on the other two control-plane nodes (2/3), so
 - All 4 nodes `Ready` on **v1.36.1+k3s1**, etcd 3/3 voters.
 - No unhealthy workloads; the node-local StatefulSets (MinIO, Redis) recovered onto their home nodes.
 - cert-manager v1.18.2 healthy; 29/30 Certificates `Ready` against their original Secrets (no re-issuance).
-- TLS Secrets were byte-identical across the whole upgrade — confirmed continuous HTTPS.
+- TLS Secrets were byte-identical across the whole upgrade — cert-manager's absence caused no certificate disruption.
+
+## End-user impact
+
+Limited, but not zero:
+
+- **Hop 1 (1.21 → 1.25):** brief slowness and request timeouts while control-plane components and ingress pods rolled. Cleared on their own; no intervention needed.
+- **qb2 disk-swap incident:** a **full services outage for its duration.** Although ingress-nginx runs on every node (DaemonSet), the public DNS names point at **qb2 specifically** — a known single point of failure — so with qb2 down, all ingress traffic was black-holed. This is independent of the upgrade and of cert-manager (the TLS Secrets were fine); it's purely the ingress SPOF.
+  - A failover solution (load-balanced VIP / DNS across all ingress nodes) was **planned but never implemented**. It's slated for the **full cluster rotation in Winter 2026–2027**; until then, qb2 going down takes ingress with it.
+- The deliberate cert-manager-absent window caused **no user impact** on its own — existing certs kept serving from their Secrets.
 
 ## Follow-ups (deferred, none blocking)
 
