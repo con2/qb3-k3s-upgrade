@@ -3,10 +3,11 @@ version: '3'
 # Recommended workflow:
 #   task up                              # create cluster, mirror prod state
 #   task upgrade:suc                     # pre-work: upgrade SUC
-#   task upgrade:cert-manager            # pre-work: upgrade cert-manager
+#   task upgrade:cert-manager:pre        # pre-work: cert-manager -> v1.11.5 (k8s 1.21 ceiling)
 #   task k3s:upgrade -- v1.25.16+k3s4   # hop 1
 #   task k3s:upgrade:watch               # watch progress (Ctrl-C when done)
 #   task k3s:health                      # verify before continuing
+#   task upgrade:cert-manager:final      # now on k8s >= 1.22: cert-manager -> latest
 #   task k3s:upgrade -- v1.29.14+k3s1   # hop 2
 #   task k3s:upgrade:watch
 #   task k3s:health
@@ -174,25 +175,51 @@ tasks:
           -o jsonpath='{.spec.template.spec.containers[0].image}'
         echo
 
-  upgrade:cert-manager:
-    desc: Upgrade cert-manager to latest stable via Helm (backs up existing resources first)
+  # cert-manager must be upgraded in two phases. The latest chart requires
+  # k8s >= 1.22, but we start on 1.21, so latest cannot be installed up front.
+  # v1.11.x is the newest line that runs on k8s 1.21 and is modern enough to
+  # survive the 1.22 API removals during the 1.21 -> 1.25 hop.
+  #   Phase A (on k8s 1.21, before first K3s hop):  upgrade:cert-manager:pre
+  #   Phase B (after reaching k8s >= 1.22):          upgrade:cert-manager:final
+  # Both use static manifests, matching how mirror:cert-manager installs it
+  # (Helm cannot adopt a static-manifest install without ownership conflicts).
+
+  upgrade:cert-manager:pre:
+    desc: "Phase A — upgrade cert-manager v1.0.3 -> v1.11.5 (newest that runs on k8s 1.21)"
     env:
       KUBECONFIG: "{{.TASKFILE_DIR}}/kubeconfig-orbstack.yaml"
     cmds:
-      - helm repo add jetstack https://charts.jetstack.io 2>/dev/null || true
-      - helm repo update jetstack
       - |
         kubectl get certificates,certificaterequests,issuers,clusterissuers -A -o yaml \
           > {{.TEMP_DIR}}/cert-manager-backup.yaml 2>/dev/null || true
         echo "Backup written to {{.TEMP_DIR}}/cert-manager-backup.yaml"
-      - >
-        helm upgrade --install cert-manager jetstack/cert-manager
-        --namespace cert-manager --create-namespace
-        --set crds.enabled=true
-        --wait
-      - kubectl rollout status deployment/cert-manager deployment/cert-manager-cainjector deployment/cert-manager-webhook -n cert-manager
+      - kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.11.5/cert-manager.yaml
+      - kubectl rollout status deployment/cert-manager deployment/cert-manager-cainjector deployment/cert-manager-webhook -n cert-manager --timeout=180s
       - |
-        echo "cert-manager version after upgrade:"
+        echo "cert-manager version after Phase A:"
+        kubectl get deployment cert-manager -n cert-manager \
+          -o jsonpath='{.spec.template.spec.containers[0].image}'
+        echo
+
+  upgrade:cert-manager:final:
+    desc: "Phase B — upgrade cert-manager v1.11.5 -> latest (run only after k8s >= 1.22)"
+    env:
+      KUBECONFIG: "{{.TASKFILE_DIR}}/kubeconfig-orbstack.yaml"
+    cmds:
+      - |
+        SERVER_MINOR=$(kubectl version -o json 2>/dev/null | grep -o '"minor": *"[0-9]*"' | head -1 | grep -o '[0-9]*')
+        if [ -n "$SERVER_MINOR" ] && [ "$SERVER_MINOR" -lt 22 ]; then
+          echo "Server is on k8s 1.${SERVER_MINOR}; cert-manager latest needs >= 1.22. Do the K3s 1.25 hop first."
+          exit 1
+        fi
+      - |
+        kubectl get certificates,certificaterequests,issuers,clusterissuers -A -o yaml \
+          > {{.TEMP_DIR}}/cert-manager-backup.yaml 2>/dev/null || true
+        echo "Backup written to {{.TEMP_DIR}}/cert-manager-backup.yaml"
+      - kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml
+      - kubectl rollout status deployment/cert-manager deployment/cert-manager-cainjector deployment/cert-manager-webhook -n cert-manager --timeout=180s
+      - |
+        echo "cert-manager version after Phase B:"
         kubectl get deployment cert-manager -n cert-manager \
           -o jsonpath='{.spec.template.spec.containers[0].image}'
         echo
